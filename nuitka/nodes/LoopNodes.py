@@ -42,8 +42,8 @@ class StatementLoop(StatementChildHavingBase):
     __slots__ = (
         "loop_variables",
         "loop_start",
-        "loop_end",
-        "loop_previous_end",
+        "loop_resume",
+        "loop_previous_resume",
         "incomplete_count",
     )
 
@@ -52,10 +52,17 @@ class StatementLoop(StatementChildHavingBase):
 
         self.loop_variables = None
 
-        # Shapes of the variable at the start.
+        # Traces of the variable at the start of loop, to detect changes and make
+        # those restart optimization.
         self.loop_start = {}
-        self.loop_end = {}
-        self.loop_previous_end = {}
+
+        # Shapes currently known to be present when the loop is started or resumed
+        # with continue statements.
+        self.loop_resume = {}
+
+        # Shapes from last time around, to detect the when it becomes complete, i.e.
+        # we have seen it all.
+        self.loop_previous_resume = {}
 
         # To allow an upper limit in case it doesn't terminate.
         self.incomplete_count = 0
@@ -93,34 +100,25 @@ class StatementLoop(StatementChildHavingBase):
         #         self.getLoopBody().mayRaiseException(exception_type)
 
     def _computeLoopBody(self, trace_collection):
-        # Rather complex stuff, pylint: disable=too-many-branches,too-many-locals,too-many-statements
+        # Rather complex stuff, pylint: disable=too-many-branches,too-many-statements
 
         loop_body = self.getLoopBody()
         if loop_body is None:
             return None, None, None
 
-        # Track if we got incomplete knowledge due to loop. If so, we are not done, even
-        # if no was optimization done, once we are complete, they can come.
-        has_incomplete = False
-
-        # Look ahead. what will be written and degrade to initial loop
-        # traces about that if we are in the first iteration, later we
-        # will have more precise knowledge.
-
+        # Look ahead. what will be written and degrade to initial loop traces
+        # about that if we are in the first iteration, later we # will have more
+        # precise knowledge.
         if self.loop_variables is None:
             self.loop_variables = getVariablesWritten(loop_body)
-
-            # Only important to mark these states as different, so we start with
-            # initial loop traces.
-            for loop_variable in self.loop_variables:
-                self.loop_start[loop_variable] = None
-
-                self.loop_previous_end[loop_variable] = None
-                self.loop_end[loop_variable] = set()
 
             first_pass = True
         else:
             first_pass = False
+
+        # Track if we got incomplete knowledge due to loop. If so, we are not done, even
+        # if no was optimization done, once we are complete, they can come.
+        has_incomplete = False
 
         # Mark all variables as loop wrap around that are written in the loop and
         # hit a 'continue' and make them become loop merges. We will strive to
@@ -130,42 +128,47 @@ class StatementLoop(StatementChildHavingBase):
         for loop_variable in self.loop_variables:
             current = trace_collection.getVariableCurrentTrace(loop_variable)
 
+            # Remember what we started with, so we can detect changes from outside the
+            # loop and make them restart the collection process, if the pre-conditions
+            # got better.
+            self.loop_start[loop_variable] = current
+
             if first_pass:
                 incomplete = True
                 has_incomplete = True
+
+                self.loop_start[loop_variable] = None
+                self.loop_previous_resume[loop_variable] = None
+
+                # Don't forget to initialize the loop resume traces with the starting point. We use
+                # a special trace class that will not take the list too serious though.
+                self.loop_resume[loop_variable] = set()
+                current.getTypeShape().emitAlternatives(
+                    self.loop_resume[loop_variable].add
+                )
             else:
                 incomplete = (
-                    self.loop_start[loop_variable].getLoopTypeShapes()
-                    != current.getLoopTypeShapes()
-                    or self.loop_end[loop_variable]
-                    != self.loop_previous_end[loop_variable]
+                    not self.loop_start[loop_variable].compareValueTrace(current)
+                    or self.loop_resume[loop_variable]
+                    != self.loop_previous_resume[loop_variable]
                 )
 
                 if incomplete:
                     has_incomplete = True
 
-            # TODO: We should be able to avoid these, but it breaks assumptions for assertions
-            # of asssigned and deleted values in the loop.
-            # if (
-            #     incomplete
-            #     and not current.isUninitTrace()
-            #     or self.loop_end[loop_variable]
-            # ):
+            # Mark the variable as loop usage before executing it.
             loop_entry_traces.add(
                 (
                     loop_variable,
                     trace_collection.markActiveVariableAsLoopMerge(
+                        loop_node=self,
+                        current=current,
                         variable=loop_variable,
-                        shapes=self.loop_end[loop_variable],
+                        shapes=self.loop_resume[loop_variable],
                         incomplete=incomplete,
-                        first_pass=first_pass,
                     ),
                 )
             )
-
-            # Remember what we started with, so we can detect changes from outside the
-            # loop and make them restart the collection process.
-            self.loop_start[loop_variable] = current
 
         abort_context = trace_collection.makeAbortStackContext(
             catch_breaks=True,
@@ -202,33 +205,47 @@ class StatementLoop(StatementChildHavingBase):
 
                 # Giving up
                 if self.incomplete_count >= 20:
-                    self.loop_previous_end[loop_variable] = self.loop_end[
+                    self.loop_previous_resume[loop_variable] = self.loop_resume[
                         loop_variable
                     ] = set((tshape_unknown_loop,))
                     continue
 
                 if not first_pass:
-                    self.loop_previous_end[loop_variable] = self.loop_end[loop_variable]
-                    self.loop_end[loop_variable] = set()
-
-                loop_end_traces = set()
-
-                for continue_collection in continue_collections:
-                    loop_end_trace = continue_collection.getVariableCurrentTrace(
+                    self.loop_previous_resume[loop_variable] = self.loop_resume[
                         loop_variable
+                    ]
+                    self.loop_resume[loop_variable] = set()
+
+                loop_resume_traces = set(
+                    continue_collection.getVariableCurrentTrace(loop_variable)
+                    for continue_collection in continue_collections
+                )
+
+                # Only if the variable is re-entering the loop, annotate that.
+                if not loop_resume_traces:
+                    # Remove the variable, need not consider it
+                    # ever again.
+                    del self.loop_resume[loop_variable]
+                    del self.loop_previous_resume[loop_variable]
+                    del self.loop_start[loop_variable]
+
+                    continue
+
+                # Keep this as a loop variable
+                self.loop_variables.add(loop_variable)
+
+                # Tell the loop trace about the continue traces.
+                loop_entry_trace.addLoopContinueTraces(loop_resume_traces)
+
+                # Also consider the entry trace before loop from here on.
+                loop_resume_traces.add(current)
+
+                self.loop_resume[loop_variable] = set()
+
+                for loop_resume_trace in loop_resume_traces:
+                    loop_resume_trace.getTypeShape().emitAlternatives(
+                        self.loop_resume[loop_variable].add
                     )
-
-                    if loop_end_trace is not loop_entry_trace:
-                        if not first_pass:
-                            loop_end_trace.getTypeShape().emitAlternatives(
-                                self.loop_end[loop_variable].add
-                            )
-
-                        loop_end_traces.add(loop_end_trace)
-
-                if loop_end_traces:
-                    loop_entry_trace.addLoopContinueTraces(loop_end_traces)
-                    self.loop_variables.add(loop_variable)
 
             # If we break, the outer collections becomes a merge of all those breaks
             # or just the one, if there is only one.
@@ -243,6 +260,16 @@ class StatementLoop(StatementChildHavingBase):
                 lambda: "Loop has incomplete variable types after %d attempts."
                 % self.incomplete_count,
             )
+        else:
+            if self.incomplete_count:
+                trace_collection.signalChange(
+                    "new_expression",
+                    self.source_ref,
+                    lambda: "Loop has complete variable types after %d attempts."
+                    % self.incomplete_count,
+                )
+
+                self.incomplete_count = 0
 
         return loop_body, break_collections, continue_collections
 

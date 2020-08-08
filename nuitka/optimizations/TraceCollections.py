@@ -49,7 +49,6 @@ from .ValueTraces import (
     ValueTraceDeleted,
     ValueTraceInit,
     ValueTraceLoopComplete,
-    ValueTraceLoopFirstPass,
     ValueTraceLoopIncomplete,
     ValueTraceMerge,
     ValueTraceUninit,
@@ -57,105 +56,6 @@ from .ValueTraces import (
 )
 
 signalChange = None
-
-
-class CollectionTracingMixin(object):
-    """ This contains for logic for maintaining active traces.
-
-        They are kept for "variable" and versions.
-    """
-
-    def __init__(self):
-        # Currently active values in the tracing.
-        self.variable_actives = {}
-
-    def getVariableCurrentTrace(self, variable):
-        """ Get the current value trace associated to this variable
-
-            It is also created on the fly if necessary. We create them
-            lazy so to keep the tracing branches minimal where possible.
-        """
-
-        return self.getVariableTrace(
-            variable=variable, version=self._getCurrentVariableVersion(variable)
-        )
-
-    def markCurrentVariableTrace(self, variable, version):
-        self.variable_actives[variable] = version
-
-    def _getCurrentVariableVersion(self, variable):
-        try:
-            return self.variable_actives[variable]
-        except KeyError:
-            # Initialize variables on the fly.
-            if not self.hasVariableTrace(variable, 0):
-                self.initVariable(variable)
-
-            self.markCurrentVariableTrace(variable, 0)
-
-            return self.variable_actives[variable]
-
-    def getActiveVariables(self):
-        return self.variable_actives.keys()
-
-    def markActiveVariableAsUnknown(self, variable):
-        current = self.getVariableCurrentTrace(variable=variable)
-
-        if not current.isUnknownTrace():
-            version = variable.allocateTargetNumber()
-
-            self.addVariableTrace(
-                variable=variable,
-                version=version,
-                trace=ValueTraceUnknown(owner=self.owner, previous=current),
-            )
-
-            self.markCurrentVariableTrace(variable, version)
-
-    def markActiveVariableAsLoopMerge(self, variable, shapes, incomplete, first_pass):
-        current = self.getVariableCurrentTrace(variable=variable)
-
-        if not current.isUninitTrace():
-            current_shape = current.getTypeShape()
-
-            if current_shape not in shapes:
-                shapes = set(shapes)
-                shapes.add(current_shape)
-
-        if python_version < 300:
-            if tshape_int_or_long in shapes:
-                if tshape_int in shapes:
-                    shapes.discard(tshape_int)
-                if tshape_long in shapes:
-                    shapes.discard(tshape_long)
-
-        if first_pass:
-            result = ValueTraceLoopFirstPass(current, shapes)
-        elif incomplete:
-            result = ValueTraceLoopIncomplete(current, shapes)
-        else:
-            # TODO: Empty is a missing optimization somewhere, but it also happens that
-            # a variable is getting released in a loop.
-            # assert shapes, (variable, current)
-
-            if not shapes:
-                shapes.add(tshape_uninit)
-
-            result = ValueTraceLoopComplete(current, shapes)
-
-        version = variable.allocateTargetNumber()
-        self.addVariableTrace(variable=variable, version=version, trace=result)
-
-        self.markCurrentVariableTrace(variable, version)
-
-        return result
-
-    def markActiveVariablesAsUnknown(self):
-        for variable in self.getActiveVariables():
-            if variable.isTempVariable():
-                continue
-
-            self.markActiveVariableAsUnknown(variable)
 
 
 class CollectionStartpointMixin(object):
@@ -390,13 +290,16 @@ class CollectionStartpointMixin(object):
             self.markActiveVariableAsUnknown(variable)
 
 
-class TraceCollectionBase(CollectionTracingMixin):
+class TraceCollectionBase(object):
+    """ This contains for logic for maintaining active traces.
+
+        They are kept for "variable" and versions.
+    """
+
     __del__ = counted_del()
 
     @counted_init
     def __init__(self, owner, name, parent):
-        CollectionTracingMixin.__init__(self)
-
         self.owner = owner
         self.parent = parent
         self.name = name
@@ -404,11 +307,93 @@ class TraceCollectionBase(CollectionTracingMixin):
         # Value state extra information per node.
         self.value_states = {}
 
+        # Currently active values in the tracing.
+        self.variable_actives = {}
+
     def __repr__(self):
         return "<%s for %s at 0x%x>" % (self.__class__.__name__, self.name, id(self))
 
     def getOwner(self):
         return self.owner
+
+    def getVariableCurrentTrace(self, variable):
+        """ Get the current value trace associated to this variable
+
+            It is also created on the fly if necessary. We create them
+            lazy so to keep the tracing branches minimal where possible.
+        """
+
+        return self.getVariableTrace(
+            variable=variable, version=self._getCurrentVariableVersion(variable)
+        )
+
+    def markCurrentVariableTrace(self, variable, version):
+        self.variable_actives[variable] = version
+
+    def _getCurrentVariableVersion(self, variable):
+        try:
+            return self.variable_actives[variable]
+        except KeyError:
+            # Initialize variables on the fly.
+            if not self.hasVariableTrace(variable, 0):
+                self.initVariable(variable)
+
+            self.markCurrentVariableTrace(variable, 0)
+
+            return self.variable_actives[variable]
+
+    def getActiveVariables(self):
+        return self.variable_actives.keys()
+
+    def markActiveVariableAsUnknown(self, variable):
+        current = self.getVariableCurrentTrace(variable=variable)
+
+        if not current.isUnknownTrace():
+            version = variable.allocateTargetNumber()
+
+            self.addVariableTrace(
+                variable=variable,
+                version=version,
+                trace=ValueTraceUnknown(owner=self.owner, previous=current),
+            )
+
+            self.markCurrentVariableTrace(variable, version)
+
+    def markActiveVariableAsLoopMerge(
+        self, loop_node, current, variable, shapes, incomplete
+    ):
+        if python_version < 300:
+            if tshape_int_or_long in shapes:
+                if tshape_int in shapes:
+                    shapes.discard(tshape_int)
+                if tshape_long in shapes:
+                    shapes.discard(tshape_long)
+
+        if incomplete:
+            result = ValueTraceLoopIncomplete(loop_node, current, shapes)
+        else:
+            # TODO: Empty is a missing optimization somewhere, but it also happens that
+            # a variable is getting released in a loop.
+            # assert shapes, (variable, current)
+
+            if not shapes:
+                shapes.add(tshape_uninit)
+
+            result = ValueTraceLoopComplete(loop_node, current, shapes)
+
+        version = variable.allocateTargetNumber()
+        self.addVariableTrace(variable=variable, version=version, trace=result)
+
+        self.markCurrentVariableTrace(variable, version)
+
+        return result
+
+    def markActiveVariablesAsUnknown(self):
+        for variable in self.getActiveVariables():
+            if variable.isTempVariable():
+                continue
+
+            self.markActiveVariableAsUnknown(variable)
 
     @staticmethod
     def signalChange(tags, source_ref, message):

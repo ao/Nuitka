@@ -28,7 +28,6 @@ Values can be seen as:
 * Assign (assignment was done)
 * Deleted (del was done, now unassigned, uninitialted)
 * Merge (result of diverged code paths, loop potentially)
-* LoopFirstPass (aggregation during loops, first pass even, not fully knowable yet)
 * LoopIncomplete (aggregation during loops, not yet fully known)
 * LoopComplete (complete knowledge of loop types)
 """
@@ -168,13 +167,18 @@ class ValueTraceBase(object):
         return False
 
     def mustHaveValue(self):
-        # Merge traces have this overloaded.
+        """ Will this definitely have a value.
 
-        return self.isInitTrace() or self.isAssignTrace()
+        Every trace has this overloaded.
+        """
+        assert False, self
 
-    @staticmethod
-    def mustNotHaveValue():
-        return False
+    def mustNotHaveValue(self):
+        """ Will this definitely have a value.
+
+        Every trace has this overloaded.
+        """
+        assert False, self
 
     def getReplacementNode(self, usage):
         # Virtual method, pylint: disable=no-self-use,unused-argument
@@ -184,9 +188,6 @@ class ValueTraceBase(object):
     def hasShapeDictionaryExact(self):
         # Virtual method, pylint: disable=no-self-use
         return False
-
-    def getLoopTypeShapes(self):
-        return set((self.getTypeShape(),))
 
 
 class ValueTraceUnassignedBase(ValueTraceBase):
@@ -200,7 +201,16 @@ class ValueTraceUnassignedBase(ValueTraceBase):
     def getTypeShape():
         return tshape_uninit
 
-    def mustNotHaveValue(self):
+    def compareValueTrace(self, other):
+        # We are unassigned, just need to know if the other one is, pylint: disable=no-self-use
+        return other.isUnassignedTrace()
+
+    @staticmethod
+    def mustHaveValue():
+        return False
+
+    @staticmethod
+    def mustNotHaveValue():
         return True
 
     def dump(self):
@@ -254,6 +264,10 @@ class ValueTraceInit(ValueTraceBase):
     def getTypeShape():
         return tshape_unknown
 
+    def compareValueTrace(self, other):
+        # We are initialized, just need to know if the other one is, pylint: disable=no-self-use
+        return other.isInitTrace()
+
     def dump(self):
         debug("  Starts initialized")
 
@@ -267,6 +281,14 @@ class ValueTraceInit(ValueTraceBase):
     def isInitTrace():
         return True
 
+    @staticmethod
+    def mustHaveValue():
+        return True
+
+    @staticmethod
+    def mustNotHaveValue():
+        return False
+
 
 class ValueTraceUnknown(ValueTraceBase):
     __slots__ = ()
@@ -277,6 +299,10 @@ class ValueTraceUnknown(ValueTraceBase):
     @staticmethod
     def getTypeShape():
         return tshape_unknown
+
+    def compareValueTrace(self, other):
+        # We are unknown, just need to know if the other one is, pylint: disable=no-self-use
+        return other.isUnknownTrace()
 
     def dump(self):
         debug("  Starts unknown")
@@ -290,6 +316,14 @@ class ValueTraceUnknown(ValueTraceBase):
     @staticmethod
     def isUnknownTrace():
         return True
+
+    @staticmethod
+    def mustHaveValue():
+        return False
+
+    @staticmethod
+    def mustNotHaveValue():
+        return False
 
     def addUsage(self):
         self.usage_count += 1
@@ -324,11 +358,12 @@ class ValueTraceUnknown(ValueTraceBase):
 class ValueTraceLoopBase(ValueTraceBase):
     # Need them all, pylint: disable=too-many-instance-attributes
 
-    __slots__ = ("type_shapes", "type_shape", "recursion")
+    __slots__ = ("loop_node", "type_shapes", "type_shape", "recursion")
 
-    def __init__(self, previous, type_shapes):
+    def __init__(self, loop_node, previous, type_shapes):
         ValueTraceBase.__init__(self, owner=previous.owner, previous=(previous,))
 
+        self.loop_node = loop_node
         self.type_shapes = type_shapes
         self.type_shape = None
 
@@ -355,9 +390,6 @@ class ValueTraceLoopBase(ValueTraceBase):
                 self.type_shape = next(iter(self.type_shapes))
 
         return self.type_shape
-
-    def getLoopTypeShapes(self):
-        return self.type_shapes
 
     def addUsage(self):
         self.usage_count += 1
@@ -416,15 +448,25 @@ class ValueTraceLoopBase(ValueTraceBase):
 class ValueTraceLoopComplete(ValueTraceLoopBase):
     __slots__ = ()
 
-    def __init__(self, previous, type_shapes):
-        ValueTraceLoopBase.__init__(self, previous, type_shapes)
+    def compareValueTrace(self, other):
+        # Incomplete loop value traces behave the same.
+        return (
+            self.__class__ is other.__class__
+            and self.loop_node == other.loop_node
+            and self.type_shapes == other.type_shapes
+        )
+
+    @staticmethod
+    def mustHaveValue():
+        return False
+
+    @staticmethod
+    def mustNotHaveValue():
+        return False
 
 
 class ValueTraceLoopIncomplete(ValueTraceLoopBase):
     __slots__ = ()
-
-    def __init__(self, previous, type_shapes):
-        ValueTraceLoopBase.__init__(self, previous, type_shapes)
 
     def getTypeShape(self):
         if self.type_shape is None:
@@ -432,12 +474,16 @@ class ValueTraceLoopIncomplete(ValueTraceLoopBase):
 
         return self.type_shape
 
+    def compareValueTrace(self, other):
+        # Incomplete loop value traces behave the same.
+        return self.__class__ is other.__class__ and self.loop_node == other.loop_node
 
-class ValueTraceLoopFirstPass(ValueTraceLoopIncomplete):
-    def __init__(self, previous, type_shapes):
-        ValueTraceLoopIncomplete.__init__(self, previous, type_shapes)
+    @staticmethod
+    def mustHaveValue():
+        return False
 
-    def mustHaveValue(self):
+    @staticmethod
+    def mustNotHaveValue():
         return False
 
 
@@ -459,6 +505,17 @@ class ValueTraceAssign(ValueTraceBase):
     @staticmethod
     def isAssignTrace():
         return True
+
+    def compareValueTrace(self, other):
+        return other.isAssignTrace() and self.assign_node is other.assign_node
+
+    @staticmethod
+    def mustHaveValue():
+        return True
+
+    @staticmethod
+    def mustNotHaveValue():
+        return False
 
     def getTypeShape(self):
         return self.assign_node.getTypeShape()
@@ -523,6 +580,19 @@ class ValueTraceMerge(ValueTraceBase):
 
     @staticmethod
     def isMergeTrace():
+        return True
+
+    def compareValueTrace(self, other):
+        if not other.isMergeTrace():
+            return False
+
+        if len(self.previous) != len(other.previous):
+            return False
+
+        for a, b in zip(self.previous, other.previous):
+            if not a.compareValueTrace(b):
+                return False
+
         return True
 
     def hasPreviousTrace(self, trace):
